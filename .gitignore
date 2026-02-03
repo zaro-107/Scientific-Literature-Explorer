@@ -1,10 +1,16 @@
 @"
+# virtual environments
 venv/
 .venv/
+app/.venv/
+
+# python cache
 __pycache__/
 *.pyc
-*.db
-.env
-.DS_Store
-"@ | Out-File -Encoding utf8 .gitignore
 
+# database
+*.db
+
+# env files
+.env
+"@ | Out-File -Encoding utf8 .gitignore
