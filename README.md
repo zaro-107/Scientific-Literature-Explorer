@@ -1,31 +1,43 @@
-##Scientific Literature Explorer
-Deep Search & Question Answering Platform using Generative AI
-Overview
+#  Scientific Literature Explorer  
+### Deep Search & Question Answering Platform using Generative AI (RAG)
 
-Scientific Literature Explorer is a community-driven platform that enables users from different backgrounds to upload scientific literature and perform deep semantic search and question answering across a continuously growing knowledge base.
+Scientific Literature Explorer is an AI-powered application that helps researchers, students, and professionals quickly understand the **core ideas of scientific papers** without reading them end-to-end.
 
-Unlike traditional keyword-based academic search systems, this project leverages Generative AI, vector embeddings, and Retrieval Augmented Generation (RAG) to provide accurate, context-aware, and explainable answers sourced from multiple research documents.
+It uses **Retrieval-Augmented Generation (RAG)** to perform semantic search over uploaded research papers and answer user questions with **source-backed responses**.
 
-##Problem Statement
+---
 
-Scientific knowledge is scattered across vast numbers of research papers, making it difficult to extract precise, meaningful information using traditional keyword-based search engines. Researchers and learners often spend significant time reading entire papers to find specific answers.
+##  Features
 
-This project aims to solve this problem by building a deep search QnA system that understands natural language queries and retrieves answers from multiple scientific documents using semantic understanding.
+-  Upload scientific research papers (PDF)
+-  Automatic text extraction and intelligent chunking
+- Semantic search using **Sentence Transformers + FAISS**
+-  Ask natural language questions about papers
+-  Answers generated using **Generative AI**
+-  Shows the most relevant source chunks used for answers
+-  Fast, interactive UI built with **Streamlit**
+-  Deployable directly on **Streamlit Cloud**
 
-✨ Key Features
+---
 
- Upload scientific papers (PDF)
+##  How It Works (RAG Pipeline)
 
- Automatic text extraction and chunking
+1. **PDF Upload**  
+   User uploads one or more research papers.
 
- Semantic embeddings for deep understanding
+2. **Text Extraction & Chunking**  
+   PDFs are parsed and split into overlapping text chunks.
 
- Vector-based search across all uploaded documents
+3. **Embedding Generation**  
+   Each chunk is converted into vector embeddings using a transformer model.
 
- AI-powered Question Answering (RAG)
+4. **Vector Search (FAISS)**  
+   Relevant chunks are retrieved based on semantic similarity to the user’s query.
 
- Source-aware answers with citations
+5. **Answer Generation (LLM)**  
+   A language model generates answers using only the retrieved context.
 
- Community-driven, multi-domain knowledge base
+---
 
- Scalable and continuously growing system
+## 🏗️ Project Structure
+
