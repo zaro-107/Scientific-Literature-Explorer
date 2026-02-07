@@ -1,278 +1,180 @@
-import os
-import uuid
-from typing import List, Dict, Any, Optional
-
+# streamlit_app.py
+import time
+import json
 import streamlit as st
 
-# PDF text extraction
-import fitz  # PyMuPDF
-
-# Your vector store (FAISS + SentenceTransformer)
-from app.embeddings import vector_store, VectorItem
+# TODO 1: import your backend pipeline function here
+# Example:
+# from app.rag import answer_question  # <- you will replace this with your actual import
 
 
-# -----------------------------
-# OpenAI client (supports v1+ and old SDK)
-# -----------------------------
-def _get_openai_mode():
-    """
-    Returns:
-      ("new", client) if OpenAI() exists
-      ("old", openai_module) if openai.ChatCompletion exists
-      (None, None) if not available
-    """
-    try:
-        from openai import OpenAI  # new SDK
-        return "new", OpenAI()
-    except Exception:
-        pass
+st.set_page_config(page_title="Scientific Literature Explorer", page_icon="📄", layout="wide")
 
-    try:
-        import openai  # old SDK
-        return "old", openai
-    except Exception:
-        return None, None
+# --- Minimal CSS polish (still Streamlit, but looks premium) ---
+st.markdown("""
+<style>
+.block-container { padding-top: 1.2rem; }
+small { opacity: 0.75; }
+.source-card {
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.badge {
+  display:inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18);
+  font-size: 12px;
+  margin-right: 6px;
+}
+</style>
+""", unsafe_allow_html=True)
 
+# --- Header ---
+st.title("📄 Scientific Literature Explorer")
+st.caption("Ask anything about your research paper — answers are grounded in the uploaded PDF.")
 
-def _ensure_openai_key():
-    """
-    Streamlit Cloud: set OPENAI_API_KEY in Secrets.
-    Local: set env var OPENAI_API_KEY.
-    """
-    if "OPENAI_API_KEY" in st.secrets:
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-
-    if not os.getenv("OPENAI_API_KEY"):
-        st.warning("OPENAI_API_KEY not found. Add it in Streamlit Secrets or set it as an environment variable.")
-        return False
-    return True
-
-
-# -----------------------------
-# Chunking + PDF extraction
-# -----------------------------
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_text = []
-    for i in range(doc.page_count):
-        page = doc.load_page(i)
-        pages_text.append(page.get_text("text"))
-    doc.close()
-    return "\n".join(pages_text)
-
-
-def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
-    """
-    Simple character-based chunking (good enough for a clean demo).
-    """
-    text = (text or "").strip()
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = end - overlap
-        if start < 0:
-            start = 0
-        if end == n:
-            break
-    return chunks
-
-
-# -----------------------------
-# RAG Answering
-# -----------------------------
-def build_prompt(question: str, sources: List[Dict[str, Any]]) -> str:
-    context = "\n\n".join(
-        [f"[score={s['score']:.3f}] {s['text']}" for s in sources]
-    )
-
-    return (
-        "You are a research paper assistant.\n"
-        "Answer using ONLY the provided context.\n"
-        "If the answer is not in the context, say: 'Not found in the provided papers.'\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "Answer:"
-    )
-
-
-def llm_answer(question: str, sources: List[Dict[str, Any]]) -> str:
-    mode, client_or_mod = _get_openai_mode()
-    prompt = build_prompt(question, sources)
-
-    if mode == "new":
-        # New OpenAI SDK (v1+)
-        client = client_or_mod
-        # Choose a model you have access to; gpt-4o-mini is a safe default for many accounts.
-        # If you want, change to "gpt-5" or another model you use.
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=prompt,
-        )
-        return (resp.output_text or "").strip()
-
-    if mode == "old":
-        # Old OpenAI SDK (0.27.10) – ChatCompletion
-        openai = client_or_mod
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a research paper assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-        )
-        return resp["choices"][0]["message"]["content"].strip()
-
-    return "OpenAI library not installed. Please install `openai` and set OPENAI_API_KEY."
-
-
-def answer_question_local(question: str, top_k: int = 5) -> Dict[str, Any]:
-    sources = vector_store.search(question, top_k=top_k)
-    if not sources:
-        return {"answer": "No indexed content found yet. Upload a PDF first.", "sources": []}
-
-    answer = llm_answer(question, sources)
-    return {"answer": answer, "sources": sources}
-
-
-# -----------------------------
-# Session helpers
-# -----------------------------
-def init_session():
-    if "indexed_papers" not in st.session_state:
-        st.session_state.indexed_papers = []  # list of dicts: {paper_id, name, chunks}
-    if "last_answer" not in st.session_state:
-        st.session_state.last_answer = None
-
-
-def add_pdf_to_index(file_name: str, file_bytes: bytes, chunk_size: int, overlap: int):
-    text = extract_text_from_pdf(file_bytes)
-    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-
-    if not chunks:
-        st.error(f"No text extracted from {file_name}.")
-        return
-
-    paper_id = str(uuid.uuid4())[:8]
-
-    metadatas: List[VectorItem] = []
-    for i in range(len(chunks)):
-        metadatas.append(
-            VectorItem(
-                chunk_db_id=i,          # for demo
-                paper_id=paper_id,
-                chunk_id=f"{paper_id}_{i}",
-                section="pdf",
-                page_start=None,
-                page_end=None,
-                lang="en",
-            )
-        )
-
-    vector_store.add(chunks, metadatas)
-
-    st.session_state.indexed_papers.append(
-        {"paper_id": paper_id, "name": file_name, "chunks": len(chunks)}
-    )
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Scientific Literature Explorer", layout="wide")
-init_session()
-
-st.title(" Scientific Literature Explorer (RAG)")
-st.caption("Upload PDFs → Index → Ask questions. Shows sources used.")
-
-# API key check
-_ensure_openai_key()
-
+# --- Sidebar controls ---
 with st.sidebar:
-    st.header(" Settings")
-    chunk_size = st.slider("Chunk size (characters)", 400, 1600, 900, 50)
-    overlap = st.slider("Overlap (characters)", 0, 400, 150, 10)
-    top_k = st.slider("Top-K chunks", 1, 10, 5)
+    st.header("⚙️ Controls")
+    strict_mode = st.toggle("Strict grounding (recommended)", value=True,
+                            help="If ON, the app refuses to answer when evidence is weak.")
+    top_k = st.slider("Top-K sources", 2, 8, 4)
+    min_score = st.slider("Min similarity threshold", 0.0, 1.0, 0.25, 0.01,
+                          help="Higher = stricter. Tune depending on your scoring.")
+    st.divider()
+    st.subheader(" Suggested questions")
+    st.write("- What is the main contribution?\n- What methodology is used?\n- What dataset?\n- What are limitations?\n- Summarize the results table.")
+
+# --- Session state ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "doc_ready" not in st.session_state:
+    st.session_state.doc_ready = False
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = []
+
+# --- Layout ---
+left, right = st.columns([0.42, 0.58], gap="large")
+
+with left:
+    st.subheader("1) Upload PDF(s)")
+    files = st.file_uploader("Upload one or more research papers (PDF)", type=["pdf"], accept_multiple_files=True)
+
+    if files:
+        st.session_state.uploaded_files = files
+        st.session_state.doc_ready = True
+        st.success(f"Loaded {len(files)} PDF(s). You can start asking questions.")
+    else:
+        st.info("Upload at least one PDF to begin.")
 
     st.divider()
-    st.subheader(" Indexed Papers")
-    if not st.session_state.indexed_papers:
-        st.write("No papers indexed yet.")
-    else:
-        for p in st.session_state.indexed_papers:
-            st.write(f"• **{p['name']}**  \n  id: `{p['paper_id']}`  | chunks: {p['chunks']}")
+    st.subheader("Session")
+    if st.button("🧹 Clear chat", use_container_width=True):
+        st.session_state.messages = []
+        st.experimental_rerun()
 
-    if st.button(" Clear Session Index"):
-        # Note: this clears the session list, but FAISS in memory stays in current process.
-        st.session_state.indexed_papers = []
-        st.session_state.last_answer = None
-        st.success("Cleared session list. (For full reset, restart the app.)")
+    # Optional: show file list
+    if st.session_state.uploaded_files:
+        st.write("**Current PDFs:**")
+        for f in st.session_state.uploaded_files:
+            st.write(f"- {f.name}")
 
+with right:
+    st.subheader("2) Ask questions (unlimited)")
+    st.caption("You can ask anything — the answer is limited only by what exists in the PDF.")
 
-col1, col2 = st.columns([1.1, 1])
+    # Render history
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m.get("sources"):
+                with st.expander("Sources used"):
+                    for s in m["sources"]:
+                        meta = s.get("meta", {})
+                        page = meta.get("page", "—")
+                        score = meta.get("score", "—")
+                        title = meta.get("title", "")
 
-with col1:
-    st.subheader("1) Upload PDFs")
-    uploaded_files = st.file_uploader(
-        "Upload one or more PDFs",
-        type=["pdf"],
-        accept_multiple_files=True
-    )
+                        st.markdown(
+                            f"""<div class="source-card">
+                            <span class="badge">page: {page}</span>
+                            <span class="badge">score: {score}</span>
+                            <span class="badge">{title}</span>
+                            <div style="margin-top:8px; white-space:pre-wrap;">{s.get("text","")}</div>
+                            </div>""",
+                            unsafe_allow_html=True
+                        )
 
-    if st.button(" Index Uploaded PDFs", type="primary"):
-        if not uploaded_files:
-            st.warning("Please upload at least one PDF.")
+    prompt = st.chat_input("Ask a question about the uploaded paper(s)...")
+
+    if prompt:
+        if not st.session_state.doc_ready:
+            st.warning("Upload at least one PDF first.")
         else:
-            with st.spinner("Indexing PDFs (extracting text + embedding)..."):
-                for f in uploaded_files:
-                    add_pdf_to_index(f.name, f.read(), chunk_size, overlap)
-            st.success("Indexing complete. Now ask questions!")
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-with col2:
-    st.subheader("2) Ask Questions (RAG)")
-    question = st.text_area(
-        "Ask a question about the indexed papers",
-        placeholder="e.g., What is the main objective of the paper?",
-        height=120
-    )
+            # --- Call backend ---
+            with st.chat_message("assistant"):
+                thinking = st.empty()
+                thinking.markdown(" Searching the paper and preparing grounded answer...")
 
-    if st.button(" Ask", type="primary"):
-        if not question.strip():
-            st.warning("Please type a question.")
-        else:
-            with st.spinner("Searching + generating answer..."):
-                result = answer_question_local(question, top_k=top_k)
-                st.session_state.last_answer = result
+                # TODO 2: call your real function here.
+                # It should return:
+                #   answer: str
+                #   sources: list[ { "text": str, "meta": { "page": int|str, "score": float|str, "title": str } } ]
+                #
+                # Example expected signature:
+                # answer, sources = answer_question(files=st.session_state.uploaded_files,
+                #                                 question=prompt, top_k=top_k)
+                #
+                # For now, placeholder:
+                answer = "⚠️ Hook up your backend function in TODO 2."
+                sources = []
 
-# Show answer + sources
-if st.session_state.last_answer:
-    st.divider()
-    st.subheader(" Answer")
-    st.write(st.session_state.last_answer["answer"])
-
-    st.subheader(" Sources used")
-    sources = st.session_state.last_answer.get("sources", [])
-    if not sources:
-        st.info("No sources returned.")
-    else:
-        for i, s in enumerate(sources, 1):
-            score = s.get("score", 0.0)
-            text = s.get("text", "")
-            meta = s.get("metadata", None)
-
-            with st.expander(f"Source #{i} | score={score:.3f}"):
-                st.write(text)
-                if meta is not None:
-                    # VectorItem dataclass is not JSON serializable by default; convert safely
+                # --- Strict grounding behavior ---
+                # If your retrieval scores are higher-is-better and normalized (0..1), this works well.
+                # Adjust if your scoring uses distance (lower-is-better).
+                best_score = None
+                if sources:
                     try:
-                        st.json(meta.__dict__)
+                        best_score = max(float(s.get("meta", {}).get("score", 0.0)) for s in sources)
                     except Exception:
-                        st.write(meta)
+                        best_score = None
+
+                if strict_mode and (not sources or (best_score is not None and best_score < min_score)):
+                    answer = ("I couldn’t find strong evidence for that question in the uploaded PDF(s). "
+                              "Try rephrasing, or ask something more specific (section name, method, dataset, etc.).")
+                    sources = []
+
+                # --- Streaming effect (simple but premium) ---
+                thinking.empty()
+                out = st.empty()
+                acc = ""
+                for ch in answer:
+                    acc += ch
+                    out.markdown(acc)
+                    time.sleep(0.004)
+
+                # Save assistant message
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources
+                })
+
+                # Export as Markdown
+                export_md = f"## Q: {prompt}\n\n## Answer\n{answer}\n\n## Sources\n"
+                for i, s in enumerate(sources, 1):
+                    meta = s.get("meta", {})
+                    export_md += f"\n### Source {i} (page {meta.get('page','—')}, score {meta.get('score','—')})\n{s.get('text','')}\n"
+
+                st.download_button("⬇️ Download this answer (Markdown)",
+                                   data=export_md.encode("utf-8"),
+                                   file_name="answer_with_sources.md",
+                                   mime="text/markdown",
+                                   use_container_width=True)
