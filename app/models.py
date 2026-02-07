@@ -1,21 +1,36 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
-from datetime import datetime
-
 from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    papers = relationship("Paper", back_populates="owner")
 
 
 class Paper(Base):
     __tablename__ = "papers"
 
     id = Column(Integer, primary_key=True, index=True)
-    paper_id = Column(String, unique=True, index=True, nullable=False)  # stable string id
-    title = Column(String, nullable=True)
-    authors = Column(String, nullable=True)
-    year = Column(String, nullable=True)
-    source = Column(String, nullable=True)  # uploaded/local/arxiv/etc
-    created_at = Column(DateTime, default=datetime.utcnow)
 
+    # Auth owner (keep it, but allow null if you upload without login)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+
+    # Your route uses these:
+    paper_id = Column(String(64), unique=True, index=True, nullable=False)  # like "a1b2c3d4e5f6"
+    title = Column(String(512), nullable=False)  # filename or title
+    source = Column(String(64), nullable=False, default="upload")  # upload / arxiv / etc.
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    owner = relationship("User", back_populates="papers")
     chunks = relationship("PaperChunk", back_populates="paper", cascade="all, delete-orphan")
 
 
@@ -24,26 +39,20 @@ class PaperChunk(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    paper_id_fk = Column(Integer, ForeignKey("papers.id"), index=True, nullable=False)
-    chunk_id = Column(String, index=True, nullable=False)  # e.g. paperid_0001
-    section = Column(String, default="unknown", index=True)
+    # papers.py uses paper_id_fk = paper.id
+    paper_id_fk = Column(Integer, ForeignKey("papers.id"), nullable=False, index=True)
+
+    chunk_id = Column(String(128), index=True, nullable=False)   # like "{paper_id}_0001"
+    section = Column(String(128), nullable=False, default="unknown")
 
     page_start = Column(Integer, nullable=True)
     page_end = Column(Integer, nullable=True)
 
-    lang = Column(String, default="en", index=True)
+    lang = Column(String(16), nullable=False, default="en")
 
-    # store both versions
     text_original = Column(Text, nullable=False)
-    text_en = Column(Text, nullable=False)
+    text_en = Column(Text, nullable=True)
 
-    # optional: store embedding_id (if your vector store uses ids)
-    embedding_id = Column(String, nullable=True, index=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
+    embedding_id = Column(String(128), index=True, nullable=True)
 
     paper = relationship("Paper", back_populates="chunks")
-
-# Helpful indexes for retrieval + filtering
-Index("ix_chunks_paper_chunk", PaperChunk.paper_id_fk, PaperChunk.chunk_id)
-Index("ix_chunks_section_page", PaperChunk.section, PaperChunk.page_start)
