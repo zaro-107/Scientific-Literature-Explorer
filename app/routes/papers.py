@@ -1,191 +1,176 @@
-import os
-import uuid
-from typing import List, Optional
-
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from fastapi import HTTPException
 
-from app.database import get_db
-from app.models import Paper, PaperChunk
-from app.language_utils import detect_language
-from app.translator import TranslatorToEnglish
-from app.embeddings import vector_store, VectorItem
+# You already have these imports in your project (based on your earlier code)
+from app.embeddings import vector_store  # must exist in your project
 
-import fitz  # PyMuPDF
-
-
-router = APIRouter(prefix="", tags=["papers"])
-translator = TranslatorToEnglish()
+# Optional: if you already have an embedding function, import it.
+# If you don't, this endpoint can still work if your vector_store supports text-query search.
+try:
+    from app.embeddings import embed_text  # OPTIONAL: define if you have it
+except Exception:
+    embed_text = None
 
 
-# ---------- helpers ----------
-def extract_text_by_page(pdf_bytes: bytes) -> List[str]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for i in range(len(doc)):
-        text = doc[i].get_text("text") or ""
-        pages.append(text.strip())
-    return pages
-
-
-def simple_chunk(text: str, max_chars: int = 1200, overlap: int = 200) -> List[str]:
-    """
-    Simple character chunker (robust & fast). Later we can upgrade to token-based.
-    """
-    text = " ".join((text or "").split())
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + max_chars, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = end - overlap
-        if start < 0:
-            start = 0
-        if start >= n:
-            break
-    return chunks
-
-
-# ---------- API schemas ----------
 class AskRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    paper_id: Optional[str] = None
+    question: str
+    top_k: int = 4
+    min_score: float = 0.25
+    strict: bool = True
 
 
-class Citation(BaseModel):
-    paper_id: str
-    chunk_id: str
-    section: str
-    page_start: Optional[int] = None
-    page_end: Optional[int] = None
-    lang: str
-    snippet: str
-    score: float
+class Source(BaseModel):
+    text: str
+    meta: Dict[str, Any] = {}
 
 
 class AskResponse(BaseModel):
-    query: str
-    top_k: int
-    matches: List[Citation]
+    answer: str
+    sources: List[Source]
 
 
-# ---------- endpoints ----------
-@router.post("/upload")
-async def upload_paper(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
+def _safe_score(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
-    pdf_bytes = await file.read()
-    pages = extract_text_by_page(pdf_bytes)
-    full_text = "\n".join([p for p in pages if p])
 
-    if len(full_text) < 200:
-        raise HTTPException(status_code=400, detail="Could not extract enough text from this PDF.")
+def _search_vector_store(question: str, top_k: int):
+    """
+    Compatibility layer: supports common vector store APIs.
+    Returns: list of dicts like {"text": "...", "meta": {...}}
+    """
+    # 1) If store supports text search directly
+    for method_name in ("search", "similarity_search", "query"):
+        fn = getattr(vector_store, method_name, None)
+        if callable(fn):
+            try:
+                # Try calling with text
+                res = fn(question, top_k=top_k)
+                if res is not None:
+                    return res
+            except TypeError:
+                # Some stores use different param names
+                try:
+                    res = fn(question, k=top_k)
+                    if res is not None:
+                        return res
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
-    # Create paper record
-    paper_id = str(uuid.uuid4())[:12]
-    paper = Paper(paper_id=paper_id, title=file.filename, source="upload")
-    db.add(paper)
-    db.commit()
-    db.refresh(paper)
+    # 2) If store needs embeddings
+    if embed_text is not None:
+        emb = embed_text(question)
+        for method_name in ("search_by_vector", "query_by_vector", "similarity_search_by_vector"):
+            fn = getattr(vector_store, method_name, None)
+            if callable(fn):
+                try:
+                    return fn(emb, top_k=top_k)
+                except TypeError:
+                    return fn(emb, k=top_k)
 
-    # Ingest chunks page-wise so citations can carry page numbers
-    all_texts_for_embedding: List[str] = []
-    all_meta: List[VectorItem] = []
+    raise RuntimeError("vector_store search method not found (add a search/query method or embed_text).")
 
-    chunk_count = 0
 
-    for page_idx, page_text in enumerate(pages, start=1):
-        if not page_text:
-            continue
+def _normalize_hits(hits: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize different hit formats into:
+      [{"text": str, "meta": {"score": float, "page":..., "paper_id":...}}]
+    """
+    norm: List[Dict[str, Any]] = []
 
-        # detect language on the page text (good enough + faster)
-        lang = detect_language(page_text, default="en")
+    if hits is None:
+        return norm
 
-        chunks = simple_chunk(page_text)
-        for ch in chunks:
-            chunk_count += 1
-            chunk_id = f"{paper_id}_{chunk_count:04d}"
+    # If vector_store returns list of your VectorItem objects
+    if isinstance(hits, list):
+        for h in hits:
+            # dict format
+            if isinstance(h, dict):
+                text = h.get("text") or h.get("content") or ""
+                meta = h.get("meta") or {}
+                if "score" not in meta and "score" in h:
+                    meta["score"] = h["score"]
+                norm.append({"text": text, "meta": meta})
+                continue
 
-            text_original = ch
-            text_en = translator.translate(ch, lang) if lang != "en" else ch
+            # object format
+            text = getattr(h, "text", None) or getattr(h, "content", None) or ""
+            meta = getattr(h, "meta", None) or {}
+            score = getattr(h, "score", None)
+            if score is not None:
+                meta = dict(meta)
+                meta["score"] = score
+            norm.append({"text": text, "meta": meta})
 
-            # store in DB
-            chunk_row = PaperChunk(
-                paper_id_fk=paper.id,
-                chunk_id=chunk_id,
-                section="unknown",
-                page_start=page_idx,
-                page_end=page_idx,
-                lang=lang,
-                text_original=text_original,
-                text_en=text_en,
-                embedding_id=chunk_id,  # we use chunk_id as embedding id
-            )
-            db.add(chunk_row)
-            db.commit()
-            db.refresh(chunk_row)
+    return norm
 
-            # collect for vector store
-            all_texts_for_embedding.append(text_en)
-            all_meta.append(
-                VectorItem(
-                    chunk_db_id=chunk_row.id,
-                    paper_id=paper.paper_id,
-                    chunk_id=chunk_id,
-                    section="unknown",
-                    page_start=page_idx,
-                    page_end=page_idx,
-                    lang=lang,
-                )
-            )
 
-    # Add all embeddings in one go (fast)
-    vector_store.add(all_texts_for_embedding, all_meta)
+def _build_grounded_answer(question: str, sources: List[Dict[str, Any]]) -> str:
+    """
+    Simple grounded answer without an LLM:
+    - Returns the most relevant chunk(s) as 'evidence'
+    - Works reliably and avoids hallucination.
+    """
+    if not sources:
+        return (
+            "I couldn’t find strong evidence for that question in the uploaded PDF(s). "
+            "Try rephrasing or ask something more specific (method, dataset, section title, etc.)."
+        )
 
-    return {
-        "message": "Paper uploaded & indexed successfully",
-        "paper_id": paper.paper_id,
-        "title": paper.title,
-        "pages": len(pages),
-        "chunks_indexed": chunk_count,
-    }
+    # Take top sources and stitch a short grounded response
+    evidence = "\n\n".join([f"- {s['text'][:800]}" for s in sources[:3] if s.get("text")])
+    return (
+        f"Based on the most relevant parts of the paper, here is the grounded evidence:\n\n{evidence}\n\n"
+        f"If you want, ask a more specific question (e.g., 'What dataset name is used?' or 'What is the main contribution?')."
+    )
 
 
 @router.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest, db: Session = Depends(get_db)):
-    results = vector_store.search(req.query, top_k=req.top_k)
+def ask(req: AskRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    citations: List[Citation] = []
-    for score, meta in results:
-        # fetch DB chunk for snippet (english + original available)
-        chunk = db.query(PaperChunk).filter(PaperChunk.id == meta.chunk_db_id).first()
-        if not chunk:
-            continue
+    try:
+        raw_hits = _search_vector_store(req.question.strip(), top_k=req.top_k)
+        hits = _normalize_hits(raw_hits)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
-        snippet = (chunk.text_en or chunk.text_original or "")[:350]
+    # Optional filtering by paper_id if your meta contains it
+    if req.paper_id:
+        filtered = []
+        for h in hits:
+            pid = (h.get("meta") or {}).get("paper_id") or (h.get("meta") or {}).get("doc_id")
+            if pid is None or str(pid) == str(req.paper_id):
+                filtered.append(h)
+        hits = filtered
 
-        citations.append(
-            Citation(
-                paper_id=meta.paper_id,
-                chunk_id=meta.chunk_id,
-                section=meta.section,
-                page_start=meta.page_start,
-                page_end=meta.page_end,
-                lang=meta.lang,
-                snippet=snippet,
-                score=score,
-            )
+    # Enforce min_score if score exists
+    def keep(h):
+        sc = (h.get("meta") or {}).get("score", None)
+        if sc is None:
+            return True
+        return _safe_score(sc) >= float(req.min_score)
+
+    hits = [h for h in hits if keep(h)]
+
+    if req.strict and not hits:
+        answer = (
+            "I couldn’t find strong evidence for that question in the uploaded PDF(s). "
+            "Try rephrasing or ask something more specific (method name, dataset, section, etc.)."
         )
+        return AskResponse(answer=answer, sources=[])
 
-    return AskResponse(query=req.query, top_k=req.top_k, matches=citations)
+    # ✅ Grounded answer (no hallucination)
+    answer = _build_grounded_answer(req.question, hits)
+
+    # Return only top_k sources
+    out_sources = [Source(text=h.get("text", ""), meta=h.get("meta") or {}) for h in hits[: req.top_k]]
+
+    return AskResponse(answer=answer, sources=out_sources)
