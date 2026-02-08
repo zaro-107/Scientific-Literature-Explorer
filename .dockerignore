@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Venv
+venv/
+.env
+
+# Git
+.git/
+.gitignore
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Data / caches / models (very important)
+data/
+datasets/
+*.pdf
+*.zip
+*.tar
+*.tar.gz
+
+# HuggingFace / torch cache (if present in repo)
+.cache/
+models/
+*.bin
+*.pt
+*.pth
+*.safetensors
