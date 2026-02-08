@@ -11,11 +11,11 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Paper, PaperChunk
 
-# Optional modules (you said you have them)
 from app.language_utils import detect_language
 from app.translator import TranslatorToEnglish
 
-from app.embeddings import VectorItem, vector_store  # your vector store wrapper
+from app.embeddings import vector_store, VectorItem  # your vector store wrapper
+
 
 router = APIRouter(prefix="", tags=["papers"])
 translator = TranslatorToEnglish()
@@ -68,6 +68,7 @@ def _vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
     """
     hits = None
 
+    # Try common method names
     for name in ("search", "similarity_search", "query"):
         fn = getattr(vector_store, name, None)
         if callable(fn):
@@ -90,6 +91,7 @@ def _vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
 
     if isinstance(hits, list):
         for h in hits:
+            # dict format
             if isinstance(h, dict):
                 text = h.get("text") or h.get("content") or ""
                 meta = h.get("meta") or {}
@@ -98,6 +100,7 @@ def _vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                 normalized.append({"text": text, "meta": meta})
                 continue
 
+            # object format (e.g., VectorItem-like)
             text = getattr(h, "text", None) or getattr(h, "content", None) or ""
             meta = getattr(h, "meta", None) or {}
             score = getattr(h, "score", None)
@@ -111,7 +114,7 @@ def _vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
 
 def _build_grounded_answer(question: str, sources: List[Dict[str, Any]]) -> str:
     """
-    No-LLM grounded answer: returns strong evidence (zero hallucination).
+    No-LLM grounded answer: returns strongest evidence (minimal hallucination).
     You can later plug an LLM here.
     """
     if not sources:
@@ -131,7 +134,7 @@ def _build_grounded_answer(question: str, sources: List[Dict[str, Any]]) -> str:
 # Request/Response Models
 # -----------------------------
 class UploadResponse(BaseModel):
-    paper_id: str
+    paper_id: str          # public string id (Paper.paper_id)
     filename: str
     pages: int
     chunks_indexed: int
@@ -139,7 +142,7 @@ class UploadResponse(BaseModel):
 
 
 class AskRequest(BaseModel):
-    paper_id: Optional[str] = None  # public paper_id (string)
+    paper_id: Optional[str] = None  # public string id (Paper.paper_id)
     question: str
     top_k: int = 4
     min_score: float = 0.25
@@ -173,15 +176,15 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
     if not pages_original or all(not p.strip() for p in pages_original):
         raise HTTPException(status_code=400, detail="Could not extract text from this PDF.")
 
-    # Detect language from first non-empty page
+    # Detect language (best-effort)
     sample_text = next((p for p in pages_original if p.strip()), "")
-    lang = None
+    lang: Optional[str] = None
     try:
         lang = detect_language(sample_text) if sample_text else None
     except Exception:
         lang = None
 
-    # Translate pages (optional)
+    # Translate pages to English if needed (best-effort)
     pages_en: List[str] = []
     if lang and lang.lower() not in ("en", "english"):
         for p in pages_original:
@@ -191,35 +194,36 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
             try:
                 pages_en.append(translator.translate(p))
             except Exception:
-                pages_en.append(p)  # fallback to original
+                pages_en.append(p)  # fallback
     else:
         pages_en = pages_original
 
-    # ✅ Create Paper record matching your models.py
-    public_paper_id = uuid.uuid4().hex  # "a1b2c3..."
+    # ✅ Create Paper record (matches your Paper model)
+    public_paper_id = uuid.uuid4().hex[:12]  # shorter like "a1b2c3d4e5f6"
     paper = Paper(
-        owner_id=None,                # set this if you add auth later
-        paper_id=public_paper_id,     # string id used by API
-        title=file.filename,          # ✅ use title (not filename)
+        owner_id=None,                 # set later if auth is added
+        paper_id=public_paper_id,      # ✅ Paper.paper_id (string)
+        title=file.filename,           # ✅ Paper.title (filename/title)
         source="upload",
     )
 
     try:
         db.add(paper)
         db.commit()
-        db.refresh(paper)  # now paper.id (int PK) exists
+        db.refresh(paper)  # ✅ now Paper.id (int PK) exists
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error creating paper: {e}")
 
     chunks_indexed = 0
 
-    # Chunk, save chunks, and index embeddings
+    # Chunk -> store in DB + vector store
     try:
         for page_num, page_text_en in enumerate(pages_en, start=1):
-            chunk_texts_en = simple_chunk(page_text_en)
+            chunk_texts = simple_chunk(page_text_en)
 
-            for idx, chunk_text_en in enumerate(chunk_texts_en):
+            for idx, chunk_text in enumerate(chunk_texts):
+                # ✅ chunk_id matches your model expectation
                 chunk_id = f"{public_paper_id}_{idx:04d}"
 
                 db_chunk = PaperChunk(
@@ -229,20 +233,20 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
                     page_start=page_num,
                     page_end=page_num,
                     lang=(lang or "en"),
-                    text_original=pages_original[page_num - 1] if page_num - 1 < len(pages_original) else "",
-                    text_en=chunk_text_en,
-                    embedding_id=chunk_id,             # id used in vector store (optional)
+                    text_original=pages_original[page_num - 1],
+                    text_en=chunk_text,                # translated or original
+                    embedding_id=chunk_id,             # optional mapping
                 )
                 db.add(db_chunk)
 
                 meta = {
-                    "paper_id": public_paper_id,  # ✅ public id
-                    "paper_db_id": paper.id,      # optional
-                    "page": page_num,
+                    "paper_id": public_paper_id,  # ✅ public id for filtering in /ask
+                    "page_start": page_num,
+                    "page_end": page_num,
                     "chunk_id": chunk_id,
                     "title": file.filename,
                 }
-                vector_store.add(VectorItem(id=chunk_id, text=chunk_text_en, meta=meta))
+                vector_store.add(VectorItem(id=chunk_id, text=chunk_text, meta=meta))
                 chunks_indexed += 1
 
         db.commit()
@@ -271,9 +275,14 @@ def ask(req: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
-    # Filter by paper_id (public string id) if provided
+    # Filter by paper_id if provided (public string id)
     if req.paper_id:
-        hits = [h for h in hits if str((h.get("meta") or {}).get("paper_id")) == str(req.paper_id)]
+        filtered: List[Dict[str, Any]] = []
+        for h in hits:
+            meta = h.get("meta") or {}
+            if str(meta.get("paper_id")) == str(req.paper_id):
+                filtered.append(h)
+        hits = filtered
 
     # Apply min_score if score exists
     final_hits: List[Dict[str, Any]] = []
