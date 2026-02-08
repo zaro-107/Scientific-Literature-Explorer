@@ -16,6 +16,7 @@ from app.translator import TranslatorToEnglish
 
 from app.embeddings import vector_store, VectorItem  # your vector store wrapper
 
+print("✅ RUNNING papers.py from commit: de0e21a - NO filename kwarg")
 
 router = APIRouter(prefix="", tags=["papers"])
 translator = TranslatorToEnglish()
