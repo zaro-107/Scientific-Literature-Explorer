@@ -13,7 +13,7 @@ BACKEND_URL = os.getenv("BACKEND_URL") or st.secrets.get("BACKEND_URL", "https:/
 
 # If your backend routes are different, change these:
 UPLOAD_ENDPOINT = "/upload"   # e.g. "/papers/upload"
-ASK_ENDPOINT = "<that path from docs>" # e.g. "/papers/ask"
+ASK_ENDPOINT = "/ask"  # e.g. "/papers/ask"
 
 
 # =========================
