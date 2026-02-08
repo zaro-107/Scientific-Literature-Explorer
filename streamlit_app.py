@@ -12,7 +12,7 @@ import streamlit as st
 BACKEND_URL = os.getenv("BACKEND_URL") or st.secrets.get("BACKEND_URL", "https://scientific-literature-explorer-1.onrender.com")
 
 # If your backend routes are different, change these:
-UPLOAD_ENDPOINT = "/upload"   # e.g. "/papers/upload"
+UPLOAD_ENDPOINT = "/upload"  # e.g. "/papers/upload"
 ASK_ENDPOINT = "/ask"  # e.g. "/papers/ask"
 
 
